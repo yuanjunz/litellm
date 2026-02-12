@@ -41,7 +41,7 @@ class GithubCopilotEmbeddingConfig(BaseEmbeddingConfig):
 
     def __init__(self) -> None:
         super().__init__()
-        self.authenticator = Authenticator()
+        self.authenticator = Authenticator.get_instance()
 
     def validate_environment(
         self,

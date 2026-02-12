@@ -21,7 +21,7 @@ class GithubCopilotConfig(OpenAIConfig):
         custom_llm_provider: str = "openai",
     ) -> None:
         super().__init__()
-        self.authenticator = Authenticator()
+        self.authenticator = Authenticator.get_instance()
 
     def _get_openai_compatible_provider_info(
         self,
@@ -86,7 +86,7 @@ class GithubCopilotConfig(OpenAIConfig):
         try:
             copilot_api_key = self.authenticator.get_api_key()
             copilot_headers = get_copilot_default_headers(copilot_api_key)
-            validated_headers = {**copilot_headers, **validated_headers}
+            validated_headers = {**validated_headers, **copilot_headers}
         except GetAPIKeyError:
             pass  # Will be handled later in the request flow
 

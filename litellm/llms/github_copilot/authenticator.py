@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -10,7 +11,6 @@ from litellm._logging import verbose_logger
 from litellm.llms.custom_httpx.http_handler import _get_httpx_client
 
 from .common_utils import (
-    APIKeyExpiredError,
     GetAccessTokenError,
     GetAPIKeyError,
     GetDeviceCodeError,
@@ -23,8 +23,34 @@ GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
 GITHUB_API_KEY_URL = "https://api.github.com/copilot_internal/v2/token"
 
+# Background refresh constants
+EARLY_REFRESH_SECONDS = 60  # refresh 60s before expiry
+
 
 class Authenticator:
+    """GitHub Copilot authenticator with singleton pattern, in-memory caching,
+    and background token refresh."""
+
+    _instance: Optional["Authenticator"] = None
+    _instance_lock: threading.Lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls) -> "Authenticator":
+        """Return the shared singleton instance (thread-safe)."""
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Reset the singleton. For testing only."""
+        with cls._instance_lock:
+            if cls._instance is not None:
+                cls._instance._cancel_timer()
+            cls._instance = None
+
     def __init__(self) -> None:
         """Initialize the GitHub Copilot authenticator with configurable token paths."""
         # Token storage paths
@@ -39,11 +65,23 @@ class Authenticator:
         self.api_key_file = os.path.join(
             self.token_dir, os.getenv("GITHUB_COPILOT_API_KEY_FILE", "api-key.json")
         )
+
+        # In-memory caches
+        self._cached_api_key_info: Optional[Dict[str, Any]] = None
+        self._cached_access_token: Optional[str] = None
+
+        # Concurrency control
+        self._refresh_lock: threading.Lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+
         self._ensure_token_dir()
+        self._load_cached_state()
+
+    # ── Public API ──────────────────────────────────────────────────────
 
     def get_access_token(self) -> str:
         """
-        Login to Copilot with retry 3 times.
+        Get the GitHub OAuth access token, using cache when available.
 
         Returns:
             str: The GitHub access token.
@@ -51,10 +89,14 @@ class Authenticator:
         Raises:
             GetAccessTokenError: If unable to obtain an access token after retries.
         """
+        if self._cached_access_token:
+            return self._cached_access_token
+
         try:
             with open(self.access_token_file, "r") as f:
                 access_token = f.read().strip()
                 if access_token:
+                    self._cached_access_token = access_token
                     return access_token
         except IOError:
             verbose_logger.warning(
@@ -65,6 +107,7 @@ class Authenticator:
             verbose_logger.debug(f"Access token acquisition attempt {attempt + 1}/3")
             try:
                 access_token = self._login()
+                self._cached_access_token = access_token
                 try:
                     with open(self.access_token_file, "w") as f:
                         f.write(access_token)
@@ -82,7 +125,10 @@ class Authenticator:
 
     def get_api_key(self) -> str:
         """
-        Get the API key, refreshing if necessary.
+        Get the API key, serving from cache when valid.
+
+        Fast path (cache hit): lock-free dict read + timestamp comparison.
+        Slow path (cache miss/expired): acquires lock, refreshes, updates cache.
 
         Returns:
             str: The GitHub Copilot API key.
@@ -90,68 +136,120 @@ class Authenticator:
         Raises:
             GetAPIKeyError: If unable to obtain an API key.
         """
-        try:
-            with open(self.api_key_file, "r") as f:
-                api_key_info = json.load(f)
-                if api_key_info.get("expires_at", 0) > datetime.now().timestamp():
-                    return api_key_info.get("token")
-                else:
-                    verbose_logger.warning("API key expired, refreshing")
-                    raise APIKeyExpiredError(
-                        message="API key expired",
-                        status_code=401,
-                    )
-        except IOError:
-            verbose_logger.warning("No API key file found or error opening file")
-        except (json.JSONDecodeError, KeyError) as e:
-            verbose_logger.warning(f"Error reading API key from file: {str(e)}")
-        except APIKeyExpiredError:
-            pass  # Already logged in the try block
+        # Fast path: return cached token if still valid (no lock, no I/O)
+        if self._is_cached_token_valid():
+            return self._cached_api_key_info["token"]  # type: ignore[index]
 
-        try:
-            api_key_info = self._refresh_api_key()
-            with open(self.api_key_file, "w") as f:
-                json.dump(api_key_info, f)
-            token = api_key_info.get("token")
-            if token:
-                return token
-            else:
+        # Slow path: acquire lock to prevent thundering herd
+        with self._refresh_lock:
+            # Double-check after acquiring lock (another thread may have refreshed)
+            if self._is_cached_token_valid():
+                return self._cached_api_key_info["token"]  # type: ignore[index]
+
+            # Try loading from file (another process may have refreshed)
+            self._load_api_key_from_file()
+            if self._is_cached_token_valid():
+                self._schedule_background_refresh()
+                return self._cached_api_key_info["token"]  # type: ignore[index]
+
+            # Perform synchronous HTTP refresh
+            try:
+                api_key_info = self._refresh_api_key()
+                self._cached_api_key_info = api_key_info
+                self._save_api_key_to_file(api_key_info)
+                self._schedule_background_refresh()
+                token = api_key_info.get("token")
+                if token:
+                    return token
                 raise GetAPIKeyError(
                     message="API key response missing token",
                     status_code=401,
                 )
-        except IOError as e:
-            verbose_logger.error(f"Error saving API key to file: {str(e)}")
-            raise GetAPIKeyError(
-                message=f"Failed to save API key: {str(e)}",
-                status_code=500,
-            )
-        except RefreshAPIKeyError as e:
-            raise GetAPIKeyError(
-                message=f"Failed to refresh API key: {str(e)}",
-                status_code=401,
-            )
+            except RefreshAPIKeyError as e:
+                raise GetAPIKeyError(
+                    message=f"Failed to refresh API key: {str(e)}",
+                    status_code=401,
+                )
 
     def get_api_base(self) -> Optional[str]:
         """
-        Get the API endpoint from the api-key.json file.
+        Get the API endpoint, preferring cached data.
 
         Returns:
             Optional[str]: The GitHub Copilot API endpoint, or None if not found.
         """
+        if self._cached_api_key_info is not None:
+            endpoints = self._cached_api_key_info.get("endpoints", {})
+            api_endpoint = endpoints.get("api")
+            if api_endpoint:
+                return api_endpoint
+
         try:
             with open(self.api_key_file, "r") as f:
                 api_key_info = json.load(f)
                 endpoints = api_key_info.get("endpoints", {})
-                api_endpoint = endpoints.get("api")
-                return api_endpoint
+                return endpoints.get("api")
         except (IOError, json.JSONDecodeError, KeyError) as e:
             verbose_logger.warning(f"Error reading API endpoint from file: {str(e)}")
             return None
 
+    # ── Background refresh ──────────────────────────────────────────────
+
+    def _schedule_background_refresh(self) -> None:
+        """Schedule a daemon timer to refresh the token before it expires."""
+        if self._cached_api_key_info is None:
+            return
+
+        expires_at = self._cached_api_key_info.get("expires_at", 0)
+        now = datetime.now().timestamp()
+        delay = max(1.0, expires_at - now - EARLY_REFRESH_SECONDS)
+
+        self._cancel_timer()
+        self._timer = threading.Timer(delay, self._do_background_refresh)
+        self._timer.daemon = True
+        self._timer.start()
+
+        verbose_logger.debug(
+            f"GitHub Copilot: background refresh scheduled in {delay:.0f}s "
+            f"(token expires in {expires_at - now:.0f}s)"
+        )
+
+    def _do_background_refresh(self) -> None:
+        """Perform background token refresh with retries."""
+        for retry in range(3):
+            try:
+                api_key_info = self._refresh_api_key()
+                with self._refresh_lock:
+                    self._cached_api_key_info = api_key_info
+                self._save_api_key_to_file(api_key_info)
+                verbose_logger.info(
+                    "GitHub Copilot: background token refresh succeeded"
+                )
+                self._schedule_background_refresh()
+                return
+            except Exception as e:
+                verbose_logger.warning(
+                    f"GitHub Copilot: background refresh attempt {retry + 1}/3 failed: {e}"
+                )
+                if retry < 2:
+                    time.sleep(10)
+
+        verbose_logger.error(
+            "GitHub Copilot: background refresh exhausted all retries. "
+            "On-demand refresh will be attempted on next request."
+        )
+
+    def _cancel_timer(self) -> None:
+        """Cancel the pending background refresh timer if any."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    # ── Token refresh (HTTP) ────────────────────────────────────────────
+
     def _refresh_api_key(self) -> Dict[str, Any]:
         """
-        Refresh the API key using the access token.
+        Refresh the API key using the access token, with exponential backoff.
 
         Returns:
             Dict[str, Any]: The API key information including token and expiration.
@@ -184,10 +282,63 @@ class Authenticator:
             except Exception as e:
                 verbose_logger.error(f"Unexpected error refreshing API key: {str(e)}")
 
+            if attempt < max_retries - 1:
+                time.sleep(min(2**attempt, 5))  # 1s, 2s backoff
+
         raise RefreshAPIKeyError(
             message="Failed to refresh API key after maximum retries",
             status_code=401,
         )
+
+    # ── Cache helpers ───────────────────────────────────────────────────
+
+    def _is_cached_token_valid(self) -> bool:
+        """Check if the in-memory cached API key is present and not expired."""
+        if self._cached_api_key_info is None:
+            return False
+        token = self._cached_api_key_info.get("token")
+        if not token:
+            return False
+        expires_at = self._cached_api_key_info.get("expires_at", 0)
+        return expires_at > datetime.now().timestamp()
+
+    def _load_cached_state(self) -> None:
+        """Best-effort load of existing token files into memory at startup."""
+        # Load access token
+        try:
+            with open(self.access_token_file, "r") as f:
+                token = f.read().strip()
+                if token:
+                    self._cached_access_token = token
+        except IOError:
+            pass
+
+        # Load API key info
+        self._load_api_key_from_file()
+
+        # If we have a valid cached token, start background refresh
+        if self._is_cached_token_valid():
+            self._schedule_background_refresh()
+
+    def _load_api_key_from_file(self) -> None:
+        """Load api-key.json into _cached_api_key_info (best-effort)."""
+        try:
+            with open(self.api_key_file, "r") as f:
+                api_key_info = json.load(f)
+                if isinstance(api_key_info, dict) and "token" in api_key_info:
+                    self._cached_api_key_info = api_key_info
+        except (IOError, json.JSONDecodeError):
+            pass
+
+    def _save_api_key_to_file(self, api_key_info: Dict[str, Any]) -> None:
+        """Persist api_key_info to disk (best-effort, errors logged)."""
+        try:
+            with open(self.api_key_file, "w") as f:
+                json.dump(api_key_info, f)
+        except IOError as e:
+            verbose_logger.error(f"Error saving API key to file: {str(e)}")
+
+    # ── Infrastructure ──────────────────────────────────────────────────
 
     def _ensure_token_dir(self) -> None:
         """Ensure the token directory exists."""

@@ -2511,7 +2511,7 @@ def completion(  # type: ignore # noqa: PLR0915
                 )
                 from litellm.llms.github_copilot.authenticator import Authenticator
 
-                copilot_auth = Authenticator()
+                copilot_auth = Authenticator.get_instance()
                 copilot_api_key = copilot_auth.get_api_key()
                 copilot_headers = get_copilot_default_headers(copilot_api_key)
                 if extra_headers:

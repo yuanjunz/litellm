@@ -54,7 +54,7 @@ class GithubCopilotResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
     def __init__(self) -> None:
         super().__init__()
-        self.authenticator = Authenticator()
+        self.authenticator = Authenticator.get_instance()
 
     @property
     def custom_llm_provider(self) -> LlmProviders:

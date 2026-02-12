@@ -751,13 +751,26 @@ def _get_openai_compatible_provider_info(  # noqa: PLR0915
         )  # type: ignore
         dynamic_api_key = api_key or get_secret_str("GALADRIEL_API_KEY")
     elif custom_llm_provider == "github_copilot":
-        (
-            api_base,
-            dynamic_api_key,
-            custom_llm_provider,
-        ) = litellm.GithubCopilotConfig()._get_openai_compatible_provider_info(
-            model, api_base, api_key, custom_llm_provider
-        )
+        try:
+            (
+                api_base,
+                dynamic_api_key,
+                custom_llm_provider,
+            ) = litellm.GithubCopilotConfig()._get_openai_compatible_provider_info(
+                model, api_base, api_key, custom_llm_provider
+            )
+        except Exception as e:
+            # Auth may fail during deployment registration (e.g. expired token at startup).
+            # Use defaults here -- actual auth happens at request time via validate_environment().
+            verbose_logger.warning(
+                f"GitHub Copilot auth deferred: {e}. Will authenticate at request time."
+            )
+            from litellm.llms.github_copilot.common_utils import (
+                GITHUB_COPILOT_API_BASE,
+            )
+
+            api_base = api_base or GITHUB_COPILOT_API_BASE
+            dynamic_api_key = api_key or "github-copilot-deferred"
     elif custom_llm_provider == "chatgpt":
         (
             api_base,
