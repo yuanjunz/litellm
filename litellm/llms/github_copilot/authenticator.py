@@ -128,7 +128,8 @@ class Authenticator:
         Get the API key, serving from cache when valid.
 
         Fast path (cache hit): lock-free dict read + timestamp comparison.
-        Slow path (cache miss/expired): acquires lock, refreshes, updates cache.
+        Slow path (cache miss/expired): acquires lock briefly to check cache/file,
+        then releases lock before any blocking I/O (HTTP refresh or device-code login).
 
         Returns:
             str: The GitHub Copilot API key.
@@ -140,7 +141,8 @@ class Authenticator:
         if self._is_cached_token_valid():
             return self._cached_api_key_info["token"]  # type: ignore[index]
 
-        # Slow path: acquire lock to prevent thundering herd
+        # Check cache and file under lock (fast operations only).
+        # Lock is released before any HTTP calls or _login().
         with self._refresh_lock:
             # Double-check after acquiring lock (another thread may have refreshed)
             if self._is_cached_token_valid():
@@ -152,24 +154,74 @@ class Authenticator:
                 self._schedule_background_refresh()
                 return self._cached_api_key_info["token"]  # type: ignore[index]
 
-            # Perform synchronous HTTP refresh
+        # --- Lock released ---
+        # All blocking I/O below runs WITHOUT holding _refresh_lock,
+        # matching the pattern used by _do_background_refresh().
+
+        # Attempt 1: HTTP refresh with current access token
+        try:
+            api_key_info = self._refresh_api_key()
+            return self._update_api_key_cache(api_key_info)
+        except RefreshAPIKeyError:
+            # Access token may be revoked by GitHub.
+            # Fall through to device-code re-login as last resort
+            # (matches behavior of authenticator.ts and github_copilot_auth.py).
+            verbose_logger.warning(
+                "GitHub Copilot: API key refresh failed. "
+                "Attempting device-code re-authentication..."
+            )
+
+        # Attempt 2: re-login via device code flow to get a fresh access token.
+        # Check if another thread already completed login while we were refreshing.
+        if self._cached_access_token:
             try:
                 api_key_info = self._refresh_api_key()
-                self._cached_api_key_info = api_key_info
-                self._save_api_key_to_file(api_key_info)
-                self._schedule_background_refresh()
-                token = api_key_info.get("token")
-                if token:
-                    return token
-                raise GetAPIKeyError(
-                    message="API key response missing token",
-                    status_code=401,
-                )
-            except RefreshAPIKeyError as e:
-                raise GetAPIKeyError(
-                    message=f"Failed to refresh API key: {str(e)}",
-                    status_code=401,
-                )
+                return self._update_api_key_cache(api_key_info)
+            except RefreshAPIKeyError:
+                pass  # Token from other thread also bad; fall through to login
+
+        try:
+            access_token = self._login()
+            self._cached_access_token = access_token
+            try:
+                with open(self.access_token_file, "w") as f:
+                    f.write(access_token)
+            except IOError:
+                verbose_logger.error("Error saving new access token to file")
+
+            # Retry API key refresh with the new access token
+            api_key_info = self._refresh_api_key()
+            return self._update_api_key_cache(api_key_info)
+        except GetAPIKeyError:
+            raise
+        except RefreshAPIKeyError as e:
+            raise GetAPIKeyError(
+                message=f"Re-authentication failed: {str(e)}",
+                status_code=401,
+            )
+        except Exception as e:
+            raise GetAPIKeyError(
+                message=f"Re-authentication failed: {str(e)}",
+                status_code=401,
+            )
+
+    def _update_api_key_cache(self, api_key_info: Dict[str, Any]) -> str:
+        """Update cache under lock and persist to file. Returns the token.
+
+        Raises:
+            GetAPIKeyError: If the api_key_info has no token.
+        """
+        token = api_key_info.get("token")
+        if not token:
+            raise GetAPIKeyError(
+                message="API key response missing token",
+                status_code=401,
+            )
+        with self._refresh_lock:
+            self._cached_api_key_info = api_key_info
+        self._save_api_key_to_file(api_key_info)
+        self._schedule_background_refresh()
+        return token
 
     def get_api_base(self) -> Optional[str]:
         """
@@ -234,10 +286,14 @@ class Authenticator:
                 if retry < 2:
                     time.sleep(10)
 
+        # All background retries exhausted. Clear the cached access token
+        # so the next on-demand request will fall through to re-login
+        # instead of retrying the same bad token.
         verbose_logger.error(
             "GitHub Copilot: background refresh exhausted all retries. "
-            "On-demand refresh will be attempted on next request."
+            "Clearing access token cache so next request triggers re-authentication."
         )
+        self._cached_access_token = None
 
     def _cancel_timer(self) -> None:
         """Cancel the pending background refresh timer if any."""
@@ -260,6 +316,7 @@ class Authenticator:
         access_token = self.get_access_token()
         headers = self._get_github_headers(access_token)
 
+        all_401 = True
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -272,18 +329,36 @@ class Authenticator:
                 if "token" in response_json:
                     return response_json
                 else:
+                    all_401 = False
                     verbose_logger.warning(
                         f"API key response missing token: {response_json}"
                     )
             except httpx.HTTPStatusError as e:
+                if e.response.status_code != 401:
+                    all_401 = False
                 verbose_logger.error(
                     f"HTTP error refreshing API key (attempt {attempt+1}/{max_retries}): {str(e)}"
                 )
             except Exception as e:
+                all_401 = False
                 verbose_logger.error(f"Unexpected error refreshing API key: {str(e)}")
 
             if attempt < max_retries - 1:
                 time.sleep(min(2**attempt, 5))  # 1s, 2s backoff
+
+        # If all failures were 401, the access token is revoked/invalid.
+        # Clear the cache so the next call to get_access_token() will try
+        # reading from file or re-login instead of returning the bad token.
+        if all_401:
+            verbose_logger.warning(
+                "GitHub Copilot: access token rejected by GitHub (401 on all retries). "
+                "Clearing cached access token to allow re-authentication."
+            )
+            self._cached_access_token = None
+            try:
+                os.remove(self.access_token_file)
+            except OSError:
+                pass
 
         raise RefreshAPIKeyError(
             message="Failed to refresh API key after maximum retries",

@@ -1,6 +1,7 @@
 from typing import Optional, Tuple
 
 import litellm
+from litellm._logging import verbose_logger
 from litellm.constants import REPLICATE_MODEL_NAME_WITH_ID_LENGTH
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
 from litellm.secret_managers.main import get_secret, get_secret_str
